@@ -27,6 +27,8 @@ use ormdb_raft::{
 use crate::database::Database;
 use crate::error::Error;
 use crate::mutation::MutationExecutor;
+#[cfg(feature = "raft")]
+use crate::mutation::{ensure_assigned_id, ensure_assigned_ids_batch};
 
 const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -569,7 +571,8 @@ impl RequestHandler {
         // applies it (and replicates to followers) via the apply callback.
         #[cfg(feature = "raft")]
         let result = if let Some(raft) = &self.raft_manager {
-            self.raft_write(raft, ClientRequest::Mutate(mutation.clone()))?
+            // Assign the insert id on the leader so all nodes apply the same id.
+            self.raft_write(raft, ClientRequest::Mutate(ensure_assigned_id(mutation)))?
         } else {
             MutationExecutor::new(&self.database).execute(mutation)?
         };
@@ -605,7 +608,7 @@ impl RequestHandler {
     ) -> Result<Response, Error> {
         #[cfg(feature = "raft")]
         let result = if let Some(raft) = &self.raft_manager {
-            self.raft_write(raft, ClientRequest::MutateBatch(batch.clone()))?
+            self.raft_write(raft, ClientRequest::MutateBatch(ensure_assigned_ids_batch(batch)))?
         } else {
             MutationExecutor::new(&self.database).execute_batch(batch)?
         };

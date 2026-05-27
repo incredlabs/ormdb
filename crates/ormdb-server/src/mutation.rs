@@ -9,6 +9,31 @@ use ormdb_proto::{FieldValue, Mutation, MutationBatch, MutationResult, Value};
 use crate::database::Database;
 use crate::error::Error;
 
+/// Ensure an `Insert` mutation carries an explicit `id` before it enters the Raft
+/// log, so every node applies the same id (otherwise replicas diverge — inserts
+/// would each generate a different id at apply time). Must be called on the leader
+/// before replication. Other mutation kinds already carry their target id.
+pub fn ensure_assigned_id(mutation: &Mutation) -> Mutation {
+    match mutation {
+        Mutation::Insert { entity, data } if !data.iter().any(|fv| fv.field == "id") => {
+            let mut data = data.clone();
+            data.push(FieldValue::new("id", Value::Uuid(StorageEngine::generate_id())));
+            Mutation::Insert {
+                entity: entity.clone(),
+                data,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Batch variant of [`ensure_assigned_id`].
+pub fn ensure_assigned_ids_batch(batch: &MutationBatch) -> MutationBatch {
+    MutationBatch {
+        mutations: batch.mutations.iter().map(ensure_assigned_id).collect(),
+    }
+}
+
 /// Executes mutation operations against the database.
 pub struct MutationExecutor<'a> {
     database: &'a Database,
@@ -136,8 +161,18 @@ impl<'a> MutationExecutor<'a> {
 
     /// Internal insert implementation that returns both ID and encoded data.
     fn do_insert(&self, entity: &str, data: &[FieldValue]) -> Result<([u8; 16], Vec<u8>), Error> {
-        // Generate a new entity ID
-        let id = StorageEngine::generate_id();
+        // Use a caller-provided id if present, else generate one. Honouring a
+        // provided id is REQUIRED for Raft: the id must be fixed on the leader
+        // before replication so every node applies the same id (otherwise replicas
+        // diverge). See `ensure_assigned_ids`.
+        let id = data
+            .iter()
+            .find(|fv| fv.field == "id")
+            .and_then(|fv| match &fv.value {
+                Value::Uuid(u) => Some(*u),
+                _ => None,
+            })
+            .unwrap_or_else(StorageEngine::generate_id);
 
         // Build field data including the ID
         let mut fields: Vec<(String, Value)> = Vec::with_capacity(data.len() + 1);
