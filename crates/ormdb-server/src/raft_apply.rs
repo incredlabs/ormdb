@@ -26,8 +26,9 @@ use crate::mutation::MutationExecutor;
 /// non-noop log entry. It executes the mutation against local storage and maps
 /// the result into a [`ClientResponse`].
 pub fn make_apply_fn(database: Arc<Database>) -> ApplyMutationFn {
-    Arc::new(move |request: &ClientRequest| {
-        let executor = MutationExecutor::new(&database);
+    Arc::new(move |request: &ClientRequest, commit_ts: u64| {
+        // Apply at the Raft log index so every node stamps the same version.
+        let executor = MutationExecutor::new_at(&database, commit_ts);
         match request {
             ClientRequest::Mutate(mutation) => executor
                 .execute(mutation)

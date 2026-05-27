@@ -117,24 +117,32 @@ async fn three_node_cluster_replicates() {
         other => panic!("expected MutationResult, got {other:?}"),
     }
 
-    // The committed entity must replicate to BOTH followers' local storage.
+    // The committed entity must replicate to every node's local storage, AND be
+    // stamped with the SAME version timestamp (the Raft log index) everywhere —
+    // deterministic application, so cluster snapshot reads agree.
+    let mut versions = Vec::new();
     for i in 0..3 {
-        if i == leader_idx {
-            continue;
-        }
-        let mut replicated = false;
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut version = None;
         while Instant::now() < deadline {
-            if nodes[i].db.storage().get_latest(&uid).unwrap().is_some() {
-                replicated = true;
+            if let Some((v, _)) = nodes[i].db.storage().get_latest(&uid).unwrap() {
+                version = Some(v);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(replicated, "write must replicate to follower node {}", i + 1);
+        let v = version.unwrap_or_else(|| panic!("write must replicate to node {}", i + 1));
+        versions.push(v);
     }
+    assert!(
+        versions.iter().all(|&v| v == versions[0]),
+        "version timestamp must be identical across nodes (deterministic apply): {versions:?}"
+    );
 
-    println!("three_node_cluster_replicates: ok (replicated to all followers)");
+    println!(
+        "three_node_cluster_replicates: ok (replicated to all nodes; version_ts={} on all)",
+        versions[0]
+    );
     // Native transport/core threads keep the process alive; exit after success.
     std::process::exit(0);
 }

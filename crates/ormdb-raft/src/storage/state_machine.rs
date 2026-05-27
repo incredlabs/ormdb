@@ -27,8 +27,10 @@ const KEY_MEMBERSHIP: &[u8] = b"membership";
 ///
 /// This allows the state machine to call back into the server's mutation executor
 /// without creating a circular dependency.
+/// The `u64` is the commit timestamp (the Raft log index), passed so the
+/// application applies the entry deterministically across all nodes.
 pub type ApplyMutationFn =
-    Arc<dyn Fn(&ClientRequest) -> Result<ClientResponse, String> + Send + Sync>;
+    Arc<dyn Fn(&ClientRequest, u64) -> Result<ClientResponse, String> + Send + Sync>;
 
 /// Raft state machine that applies mutations to ORMDB storage.
 ///
@@ -131,12 +133,15 @@ impl OrmdbStateMachine {
     }
 
     /// Apply a client request and return the response.
-    fn apply_request(&self, request: &ClientRequest) -> ClientResponse {
+    ///
+    /// `commit_ts` is the Raft log index of the entry; passed to the application
+    /// so writes are stamped deterministically (identically on every node).
+    fn apply_request(&self, request: &ClientRequest, commit_ts: u64) -> ClientResponse {
         match request {
             ClientRequest::Noop => ClientResponse::NoopResult,
             _ => {
                 if let Some(apply_fn) = &self.apply_fn {
-                    match apply_fn(request) {
+                    match apply_fn(request, commit_ts) {
                         Ok(response) => response,
                         Err(e) => ClientResponse::Error(e),
                     }
@@ -201,7 +206,9 @@ impl RaftStateMachine<TypeConfig> for OrmdbStateMachine {
 
             let response = match entry.payload {
                 EntryPayload::Blank => ClientResponse::NoopResult,
-                EntryPayload::Normal(request) => self.apply_request(&request),
+                EntryPayload::Normal(request) => {
+                    self.apply_request(&request, entry.log_id.index)
+                }
                 EntryPayload::Membership(membership) => {
                     *self.membership.write() = StoredMembership::new(Some(entry.log_id), membership);
                     ClientResponse::NoopResult
@@ -361,7 +368,7 @@ mod tests {
         let snapshot_dir = tempfile::tempdir().unwrap();
         let mut sm = OrmdbStateMachine::new(storage, db, snapshot_dir.path().to_path_buf())
             .unwrap()
-            .with_apply_fn(Arc::new(|_request| {
+            .with_apply_fn(Arc::new(|_request, _commit_ts| {
                 Ok(ClientResponse::mutation_result(
                     ormdb_proto::MutationResult::affected(1),
                 ))

@@ -37,12 +37,44 @@ pub fn ensure_assigned_ids_batch(batch: &MutationBatch) -> MutationBatch {
 /// Executes mutation operations against the database.
 pub struct MutationExecutor<'a> {
     database: &'a Database,
+    /// Deterministic commit timestamp for this mutation, if applying from the
+    /// Raft log (the log index). When set, all writes use it as their version
+    /// timestamp and it becomes the watermark — so every node applies the same
+    /// committed entry at the same version, and cluster snapshot reads agree.
+    /// When `None`, writes use a per-call wall-clock timestamp (single-node path).
+    commit_ts: Option<u64>,
 }
 
 impl<'a> MutationExecutor<'a> {
-    /// Create a new mutation executor.
+    /// Create a new mutation executor (wall-clock version timestamps).
     pub fn new(database: &'a Database) -> Self {
-        Self { database }
+        Self { database, commit_ts: None }
+    }
+
+    /// Create a mutation executor that applies at a fixed commit timestamp (the
+    /// Raft log index), for deterministic application across cluster nodes.
+    pub fn new_at(database: &'a Database, commit_ts: u64) -> Self {
+        Self { database, commit_ts: Some(commit_ts) }
+    }
+
+    /// The version key for a write: the deterministic commit timestamp if set,
+    /// otherwise the current wall-clock time.
+    fn version_key(&self, id: [u8; 16]) -> VersionedKey {
+        match self.commit_ts {
+            Some(ts) => VersionedKey::new(id, ts),
+            None => VersionedKey::now(id),
+        }
+    }
+
+    /// Advance the read watermark after a successful mutation: to the commit
+    /// timestamp (deterministic) when applying from the Raft log, otherwise to now.
+    fn advance_watermark(&self) {
+        match self.commit_ts {
+            Some(ts) => self.database.storage().advance_watermark_to(ts),
+            None => {
+                self.database.storage().tick_watermark();
+            }
+        }
     }
 
     /// Execute a single mutation (without CDC logging).
@@ -54,7 +86,7 @@ impl<'a> MutationExecutor<'a> {
             Mutation::Upsert { entity, id, data } => self.execute_upsert(entity, id.as_ref(), data),
         }?;
         // Advance the read watermark so snapshot reads observe this write.
-        self.database.storage().tick_watermark();
+        self.advance_watermark();
         Ok(result)
     }
 
@@ -80,7 +112,7 @@ impl<'a> MutationExecutor<'a> {
             }
         }?;
         // Advance the read watermark so snapshot reads observe this write.
-        self.database.storage().tick_watermark();
+        self.advance_watermark();
         Ok(result)
     }
 
@@ -190,7 +222,7 @@ impl<'a> MutationExecutor<'a> {
             .map_err(|e| Error::Database(format!("failed to encode entity: {}", e)))?;
 
         // Store the entity
-        let key = VersionedKey::now(id);
+        let key = self.version_key(id);
         self.database
             .storage()
             .put_typed(entity, key, Record::new(encoded.clone()))
@@ -290,7 +322,7 @@ impl<'a> MutationExecutor<'a> {
         let encoded = encode_entity(&fields)
             .map_err(|e| Error::Database(format!("failed to encode entity: {}", e)))?;
 
-        let key = VersionedKey::now(*id);
+        let key = self.version_key(*id);
         self.database
             .storage()
             .put_typed(entity, key, Record::new(encoded.clone()))
@@ -484,7 +516,7 @@ impl<'a> MutationExecutor<'a> {
             .map_err(|e| Error::Database(format!("failed to encode entity: {}", e)))?;
 
         // Store the entity
-        let key = VersionedKey::now(id);
+        let key = self.version_key(id);
         self.database
             .storage()
             .put_typed(entity, key, Record::new(encoded.clone()))

@@ -176,6 +176,18 @@ impl StorageEngine {
         ts
     }
 
+    /// Advance the read watermark to a specific, externally-chosen timestamp
+    /// (monotonically — never backwards). Used on the Raft apply path where the
+    /// commit timestamp is the log index, so the watermark is *deterministic*
+    /// across all nodes and cluster-wide snapshot reads agree.
+    pub fn advance_watermark_to(&self, ts: u64) {
+        let mut clock = self.commit_clock.lock().unwrap_or_else(|e| e.into_inner());
+        if ts > *clock {
+            *clock = ts;
+            self.watermark.store(ts, Ordering::Release);
+        }
+    }
+
     /// Check if the database was recovered from a previous crash.
     pub fn was_recovered(&self) -> bool {
         self.db.was_recovered()
