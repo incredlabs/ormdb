@@ -8,6 +8,11 @@
 //! Uses the async manager APIs (the `*_blocking` variants are for the synchronous
 //! request handler; calling them on the test's runtime thread would deadlock).
 //!
+//! Note on teardown: openraft's core and the nng transport spawn native threads
+//! that are not joined when the runtime drops, so the process does not exit on its
+//! own after the test body completes. All assertions run first; we then exit
+//! explicitly. (Multi-node, cleanly-torn-down verification is M6's Jepsen harness.)
+//!
 //! Runs only with `--features raft`.
 #![cfg(feature = "raft")]
 
@@ -29,14 +34,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-// IGNORED: live in-process single-node bring-up currently hangs (the openraft core,
-// its sled-backed log storage, and the state-machine apply callback all share one sled
-// Db in-process; driving client_write/ensure_linearizable end-to-end deadlocks). The
-// apply bridge, leader routing, and ReadIndex primitives are unit-verified
-// (tests/raft_apply.rs + 34 ormdb-raft tests + compilation). End-to-end consensus is
-// validated against a real, separate-process cluster in M6 via the Jepsen harness, which
-// is also where this hang will be investigated. Run manually: `--features raft -- --ignored`.
-#[ignore = "in-process single-node Raft bring-up hangs; end-to-end verified via M6 cluster harness"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_node_raft_write_and_linearizable_read() {
     let dir = tempfile::tempdir().unwrap();
@@ -84,17 +81,24 @@ async fn single_node_raft_write_and_linearizable_read() {
     assert!(became_leader, "single node should become leader");
 
     // Write through Raft consensus (committed + applied via the apply callback).
-    let resp = manager
-        .write(ClientRequest::Mutate(Mutation::insert(
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.write(ClientRequest::Mutate(Mutation::insert(
             "User",
             vec![FieldValue::new("name", "Alice")],
-        )))
-        .await
-        .expect("raft write");
+        ))),
+    )
+    .await
+    .expect("raft write timed out")
+    .expect("raft write");
     assert!(!resp.is_error(), "raft write should succeed: {resp:?}");
 
     // ReadIndex, then read local storage — must observe the committed write.
-    manager.ensure_linearizable().await.expect("linearizable read point");
+    tokio::time::timeout(Duration::from_secs(10), manager.ensure_linearizable())
+        .await
+        .expect("ensure_linearizable timed out")
+        .expect("linearizable read point");
+
     let executor = QueryExecutor::new(database.storage(), database.catalog());
     let result = executor.execute(&GraphQuery::new("User")).unwrap();
     assert_eq!(result.entities[0].len(), 1, "the replicated user is readable");
@@ -103,5 +107,9 @@ async fn single_node_raft_write_and_linearizable_read() {
         other => panic!("unexpected name value: {other:?}"),
     }
 
-    manager.shutdown().await.ok();
+    // All assertions passed. Best-effort graceful shutdown, then exit explicitly
+    // because native transport/core threads keep the process alive otherwise.
+    let _ = tokio::time::timeout(Duration::from_secs(5), manager.shutdown()).await;
+    println!("single_node_raft_write_and_linearizable_read: ok");
+    std::process::exit(0);
 }
