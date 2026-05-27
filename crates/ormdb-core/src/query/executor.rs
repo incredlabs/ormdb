@@ -39,6 +39,14 @@ pub struct QueryExecutor<'a> {
     security_context: Option<&'a SecurityContext>,
     /// Policy store for RLS policy retrieval.
     policy_store: Option<&'a PolicyStore>,
+    /// Snapshot read timestamp for the current execution.
+    ///
+    /// When set (via [`Self::execute_as_of`] / [`Self::execute_snapshot`]), every
+    /// entity sub-read of the graph fetch — root and all relation includes — is
+    /// served as-of this timestamp, yielding a snapshot-consistent (graph-atomic)
+    /// result. When `None`, reads observe the latest committed version per entity
+    /// (read-committed), which permits fractured graph reads.
+    read_ts: std::cell::Cell<Option<u64>>,
 }
 
 impl<'a> QueryExecutor<'a> {
@@ -50,6 +58,7 @@ impl<'a> QueryExecutor<'a> {
             metrics: None,
             security_context: None,
             policy_store: None,
+            read_ts: std::cell::Cell::new(None),
         }
     }
 
@@ -65,6 +74,7 @@ impl<'a> QueryExecutor<'a> {
             metrics: Some(metrics),
             security_context: None,
             policy_store: None,
+            read_ts: std::cell::Cell::new(None),
         }
     }
 
@@ -89,6 +99,32 @@ impl<'a> QueryExecutor<'a> {
     #[instrument(skip(self, query), fields(entity = %query.root_entity))]
     pub fn execute(&self, query: &GraphQuery) -> Result<QueryResult, Error> {
         self.execute_with_budget(query, FanoutBudget::default())
+    }
+
+    /// Execute a graph fetch as-of an explicit read timestamp.
+    ///
+    /// All sub-reads (root + every relation include) are served as-of `read_ts`,
+    /// so the assembled graph corresponds to a single commit cut — a
+    /// snapshot-consistent (graph-atomic) graph fetch. This is the milestone-M4
+    /// fix that eliminates fractured graph reads.
+    ///
+    /// Note: the snapshot path currently materializes entities via as-of scans
+    /// over the versioned store (the index/columnar fast paths are not yet
+    /// snapshot-aware), and resolves FK-based relation includes. Many-to-many
+    /// join-table relations on the snapshot path are future work.
+    pub fn execute_as_of(&self, query: &GraphQuery, read_ts: u64) -> Result<QueryResult, Error> {
+        self.read_ts.set(Some(read_ts));
+        let result = self.execute_with_budget(query, FanoutBudget::default());
+        self.read_ts.set(None);
+        result
+    }
+
+    /// Execute a graph fetch under a snapshot taken at call time.
+    ///
+    /// Equivalent to [`Self::execute_as_of`] with `read_ts = now`. Writes that
+    /// commit after this point are excluded from the result.
+    pub fn execute_snapshot(&self, query: &GraphQuery) -> Result<QueryResult, Error> {
+        self.execute_as_of(query, crate::storage::key::current_timestamp())
     }
 
     /// Execute a query with a custom fanout budget.
@@ -536,7 +572,36 @@ impl<'a> QueryExecutor<'a> {
     ///
     /// Both paths support early termination for LIMIT queries when no ORDER BY is specified.
     #[instrument(skip(self, plan), fields(entity = %plan.root_entity, has_filter = plan.filter.is_some()))]
+    /// Fetch root entities as-of a read timestamp (snapshot path).
+    ///
+    /// Materializes every entity of the root type from the versioned store
+    /// as-of `read_ts` and applies the plan filter on the as-of record. Bypasses
+    /// the index/columnar fast paths, which read the latest version and are not
+    /// snapshot-aware.
+    fn fetch_entities_as_of(&self, plan: &QueryPlan, read_ts: u64) -> Result<Vec<EntityRow>, Error> {
+        self.record_access_path(AccessPath::Row);
+        let mut rows = Vec::new();
+        for result in self.storage.scan_entity_type_as_of(&plan.root_entity, read_ts) {
+            let (entity_id, _version_ts, record) = result?;
+            let fields = decode_entity(&record.data)?;
+            let row = EntityRow::with_index(entity_id, fields);
+            if let Some(filter) = &plan.filter {
+                if !FilterEvaluator::evaluate(filter, &row)? {
+                    continue;
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
     fn fetch_entities(&self, plan: &QueryPlan) -> Result<Vec<EntityRow>, Error> {
+        // Snapshot path: when a read timestamp is set, materialize root entities
+        // as-of that timestamp (index/columnar fast paths are not snapshot-aware).
+        if let Some(read_ts) = self.read_ts.get() {
+            return self.fetch_entities_as_of(plan, read_ts);
+        }
+
         // Try hash index for simple equality filters (O(1) lookup)
         if let Some(ormdb_proto::FilterExpr::Eq { field, value }) = &plan.filter {
             // Check if hash index exists for this column
@@ -1512,11 +1577,70 @@ impl<'a> QueryExecutor<'a> {
     /// Uses hash join for larger datasets (>100 parents or >1000 estimated children)
     /// and nested loop for smaller datasets to minimize overhead.
     #[instrument(skip(self, source_ids, include), fields(path = %include.path, source_count = source_ids.len()))]
+    /// Resolve a FK-based relation include as-of a read timestamp (snapshot path).
+    ///
+    /// Scans the target entity type as-of `read_ts`, matches each child's foreign
+    /// key against the source (parent) ids, and applies the include filter on the
+    /// as-of record. Equivalent to a nested-loop join restricted to a single
+    /// commit cut. Many-to-many join-table relations are not handled here yet.
+    fn resolve_include_as_of(
+        &self,
+        source_ids: &[[u8; 16]],
+        include: &IncludePlan,
+        read_ts: u64,
+    ) -> Result<(Vec<EntityRow>, Vec<Edge>), Error> {
+        let target_entity = &include.relation.to_entity;
+        let fk_field = &include.relation.to_field;
+        let source_id_set: HashSet<[u8; 16]> = source_ids.iter().cloned().collect();
+
+        let mut rows = Vec::new();
+        let mut edges = Vec::new();
+
+        for result in self.storage.scan_entity_type_as_of(target_entity, read_ts) {
+            let (entity_id, _version_ts, record) = result?;
+            let fields = decode_entity(&record.data)?;
+
+            let from_id = match fields.iter().find(|(n, _)| n == fk_field).map(|(_, v)| v) {
+                Some(Value::Uuid(fk_id)) if source_id_set.contains(fk_id) => *fk_id,
+                _ => continue,
+            };
+
+            let row = EntityRow::with_index(entity_id, fields);
+            if let Some(filter) = &include.filter {
+                if !FilterEvaluator::evaluate(filter, &row)? {
+                    continue;
+                }
+            }
+
+            rows.push(row);
+            edges.push(Edge::new(from_id, entity_id));
+        }
+
+        Ok((rows, edges))
+    }
+
     fn resolve_single_include(
         &self,
         source_ids: &[[u8; 16]],
         include: &IncludePlan,
     ) -> Result<(Vec<EntityRow>, Vec<Edge>), Error> {
+        // Snapshot path: resolve the relation as-of the execution's read timestamp
+        // so the related entities share one commit cut with the root.
+        if let Some(read_ts) = self.read_ts.get() {
+            let (mut rows, edges) = self.resolve_include_as_of(source_ids, include, read_ts)?;
+            self.sort_rows(&mut rows, &include.order_by);
+            if let Some(pagination) = &include.pagination {
+                let source_id_set: HashSet<[u8; 16]> = source_ids.iter().cloned().collect();
+                return Ok(self.apply_per_parent_pagination(
+                    &rows,
+                    &edges,
+                    &source_id_set,
+                    pagination,
+                ));
+            }
+            return Ok((rows, edges));
+        }
+
         if let Some((mut rows, edges)) = self.resolve_include_via_index(source_ids, include)? {
             self.sort_rows(&mut rows, &include.order_by);
 

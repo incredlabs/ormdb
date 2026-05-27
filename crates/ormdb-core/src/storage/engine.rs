@@ -264,6 +264,88 @@ impl StorageEngine {
         Ok(None)
     }
 
+    /// Read an entity as-of a read timestamp (snapshot semantics).
+    ///
+    /// Returns the newest version whose `version_ts <= read_ts`. Unlike
+    /// [`Self::get_at`], if that newest version is a tombstone the entity is
+    /// treated as absent (`Ok(None)`) rather than resurrecting an older live
+    /// version. This is the read primitive for snapshot-consistent graph
+    /// fetches (milestone M4): every sub-read of a graph fetch uses the same
+    /// `read_ts`, so the assembled graph corresponds to a single commit cut.
+    pub fn get_as_of(
+        &self,
+        entity_id: &[u8; 16],
+        read_ts: u64,
+    ) -> Result<Option<(u64, Record)>, Error> {
+        let max_key = VersionedKey::new(*entity_id, read_ts);
+        let min_key = VersionedKey::min_for_entity(*entity_id);
+
+        if let Some(result) = self
+            .data_tree
+            .range(min_key.encode()..=max_key.encode())
+            .next_back()
+        {
+            let (key_bytes, value_bytes) = result?;
+            let key = VersionedKey::decode(&key_bytes).ok_or(Error::InvalidKey)?;
+            if key.entity_id != *entity_id {
+                return Ok(None);
+            }
+            let record = Record::from_bytes(&value_bytes)?;
+            if record.deleted {
+                return Ok(None);
+            }
+            return Ok(Some((key.version_ts, record)));
+        }
+
+        Ok(None)
+    }
+
+    /// Batch variant of [`Self::get_as_of`]. Returns a Vec parallel to `entity_ids`.
+    pub fn get_as_of_batch(
+        &self,
+        entity_ids: &[[u8; 16]],
+        read_ts: u64,
+    ) -> Result<Vec<Option<(u64, Record)>>, Error> {
+        entity_ids
+            .iter()
+            .map(|id| self.get_as_of(id, read_ts))
+            .collect()
+    }
+
+    /// Scan all entities of a type as-of a read timestamp.
+    ///
+    /// Yields `(entity_id, version_ts, Record)` for every entity whose state
+    /// as-of `read_ts` is a live (non-tombstone) record. Entities created after
+    /// `read_ts`, or deleted at-or-before it, are skipped. This is the as-of
+    /// analogue of [`Self::scan_entity_type`].
+    pub fn scan_entity_type_as_of(
+        &self,
+        entity_type: &str,
+        read_ts: u64,
+    ) -> impl Iterator<Item = Result<([u8; 16], u64, Record), Error>> + '_ {
+        let prefix = self.type_index_prefix(entity_type);
+        let prefix_len = prefix.len();
+
+        self.type_index_tree
+            .scan_prefix(&prefix)
+            .filter_map(move |result| match result {
+                Ok((key, _)) => {
+                    if key.len() != prefix_len + 16 {
+                        return Some(Err(Error::InvalidKey));
+                    }
+                    let mut entity_id = [0u8; 16];
+                    entity_id.copy_from_slice(&key[prefix_len..]);
+
+                    match self.get_as_of(&entity_id, read_ts) {
+                        Ok(Some((version_ts, record))) => Some(Ok((entity_id, version_ts, record))),
+                        Ok(None) => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+                Err(e) => Some(Err(e.into())),
+            })
+    }
+
     /// Scan all versions of an entity.
     ///
     /// Returns versions in chronological order (oldest first).
