@@ -19,15 +19,23 @@ use crate::types::{ClientRequest, ClientResponse, NodeId, OrmdbRaft, TypeConfig}
 /// Type alias for shared cluster manager.
 pub type SharedRaftClusterManager = Arc<RaftClusterManager>;
 
-/// A write submitted to the async writer task, carrying a synchronous reply channel.
+/// A job handed to the async Raft task, carrying a synchronous reply channel.
 ///
 /// This lets a synchronous caller (e.g. the request handler, which runs on a
-/// blocking thread) submit a write to async Raft without itself touching the
-/// async runtime: it hands the request to the writer task and blocks on a std
-/// channel for the committed result.
-struct WriteJob {
-    request: ClientRequest,
-    reply: std::sync::mpsc::Sender<Result<ClientResponse, RaftError>>,
+/// blocking thread) drive async Raft operations without itself touching the
+/// async runtime: it hands the job to the background task and blocks on a std
+/// channel for the result.
+enum RaftJob {
+    /// Replicate a write and return the applied result (leader only).
+    Write {
+        request: ClientRequest,
+        reply: std::sync::mpsc::Sender<Result<ClientResponse, RaftError>>,
+    },
+    /// Establish a linearizable read point via ReadIndex (leadership heartbeat +
+    /// wait for the state machine to catch up). Returns once reads are safe.
+    EnsureLinearizable {
+        reply: std::sync::mpsc::Sender<Result<(), RaftError>>,
+    },
 }
 
 /// Manages the Raft cluster for ORMDB.
@@ -47,8 +55,8 @@ pub struct RaftClusterManager {
     config: RaftConfig,
     /// Cached leader information.
     cached_leader: RwLock<Option<(NodeId, String)>>,
-    /// Sender to the async writer task (for synchronous callers).
-    write_tx: tokio::sync::mpsc::UnboundedSender<WriteJob>,
+    /// Sender to the async Raft job task (for synchronous callers).
+    job_tx: tokio::sync::mpsc::UnboundedSender<RaftJob>,
     /// Transport shutdown handle.
     _transport_shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -116,19 +124,34 @@ impl RaftClusterManager {
 
         let raft = Arc::new(raft);
 
-        // Spawn an async writer task. Synchronous callers submit writes via
-        // `write_blocking`, which forwards them here and blocks on a std channel.
-        let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<WriteJob>();
+        // Spawn an async Raft job task. Synchronous callers submit jobs via
+        // `write_blocking` / `ensure_linearizable_blocking`, which forward them
+        // here and block on a std channel for the result.
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<RaftJob>();
         {
             let raft = raft.clone();
             tokio::spawn(async move {
-                while let Some(job) = write_rx.recv().await {
-                    let result = raft
-                        .client_write(job.request)
-                        .await
-                        .map(|r| r.data)
-                        .map_err(|e| RaftError::Write(e.to_string()));
-                    let _ = job.reply.send(result);
+                while let Some(job) = job_rx.recv().await {
+                    match job {
+                        RaftJob::Write { request, reply } => {
+                            let result = raft
+                                .client_write(request)
+                                .await
+                                .map(|r| r.data)
+                                .map_err(|e| RaftError::Write(e.to_string()));
+                            let _ = reply.send(result);
+                        }
+                        RaftJob::EnsureLinearizable { reply } => {
+                            // ReadIndex: confirm leadership via heartbeat quorum and
+                            // wait for the state machine to apply up to the read log id.
+                            let result = raft
+                                .ensure_linearizable()
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| RaftError::Read(e.to_string()));
+                            let _ = reply.send(result);
+                        }
+                    }
                 }
             });
         }
@@ -150,7 +173,7 @@ impl RaftClusterManager {
             raft,
             config,
             cached_leader: RwLock::new(None),
-            write_tx,
+            job_tx,
             _transport_shutdown: shutdown_tx,
         })
     }
@@ -200,15 +223,43 @@ impl RaftClusterManager {
     /// async runtime from the calling thread. Only succeeds on the leader.
     pub fn write_blocking(&self, request: ClientRequest) -> Result<ClientResponse, RaftError> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.write_tx
-            .send(WriteJob {
+        self.job_tx
+            .send(RaftJob::Write {
                 request,
                 reply: reply_tx,
             })
-            .map_err(|_| RaftError::Internal("raft writer task is not running".to_string()))?;
+            .map_err(|_| RaftError::Internal("raft job task is not running".to_string()))?;
         reply_rx
             .recv()
-            .map_err(|_| RaftError::Internal("raft writer task dropped the reply".to_string()))?
+            .map_err(|_| RaftError::Internal("raft job task dropped the reply".to_string()))?
+    }
+
+    /// Establish a linearizable read point (async).
+    ///
+    /// Confirms leadership via a heartbeat quorum and waits for the state machine
+    /// to apply up to the read log id (ReadIndex). After this returns `Ok`, a read
+    /// of local state observes everything committed cluster-wide as of the call.
+    pub async fn ensure_linearizable(&self) -> Result<(), RaftError> {
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map(|_| ())
+            .map_err(|e| RaftError::Read(e.to_string()))
+    }
+
+    /// Blocking variant of [`Self::ensure_linearizable`] for synchronous callers.
+    ///
+    /// Call this before serving a linearizable read from local state. Like
+    /// [`Self::write_blocking`], it drives the async runtime via the background
+    /// job task and blocks on a std channel.
+    pub fn ensure_linearizable_blocking(&self) -> Result<(), RaftError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.job_tx
+            .send(RaftJob::EnsureLinearizable { reply: reply_tx })
+            .map_err(|_| RaftError::Internal("raft job task is not running".to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| RaftError::Internal("raft job task dropped the reply".to_string()))?
     }
 
     /// Check if this node is the leader.

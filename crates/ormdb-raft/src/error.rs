@@ -25,6 +25,10 @@ pub enum RaftError {
     #[error("Write error: {0}")]
     Write(String),
 
+    /// Error establishing a linearizable read (ReadIndex / leadership check).
+    #[error("Linearizable read error: {0}")]
+    Read(String),
+
     /// Error during membership changes.
     #[error("Membership change error: {0}")]
     MembershipChange(String),
