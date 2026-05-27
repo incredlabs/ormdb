@@ -236,6 +236,15 @@ pub fn value_to_json(value: &Value) -> serde_json::Value {
             let hex_arr: Vec<String> = arr.iter().map(uuid_to_hex).collect();
             serde_json::json!(hex_arr)
         }
+        Value::Vector(v) => serde_json::json!(v),
+        Value::GeoPoint { lat, lon } => serde_json::json!({ "lat": lat, "lon": lon }),
+        Value::GeoPolygon(vertices) => {
+            let pts: Vec<serde_json::Value> = vertices
+                .iter()
+                .map(|(lat, lon)| serde_json::json!({ "lat": lat, "lon": lon }))
+                .collect();
+            serde_json::json!(pts)
+        }
     }
 }
 
