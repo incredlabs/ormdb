@@ -306,6 +306,80 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Commit the transaction with a monotonic **commit timestamp** stamped on
+    /// every write, advancing the read watermark only once the data is visible.
+    ///
+    /// Unlike [`Self::commit`] (which preserves each op's build-time `version_ts`),
+    /// this assigns one commit timestamp `ts` to all writes in the transaction,
+    /// allocated under the engine's commit-clock lock as
+    /// `max(current_timestamp(), last_committed + 1)`. The lock is held across the
+    /// sled commit, and the watermark is advanced to `ts` only after the commit
+    /// succeeds. A reader that captures the watermark via
+    /// [`StorageEngine::read_watermark`] therefore observes a consistent prefix,
+    /// and any concurrent commit lands at a strictly greater `ts` — which is what
+    /// makes snapshot graph fetches sound under concurrency.
+    ///
+    /// Returns the allocated commit timestamp.
+    pub fn commit_versioned(self) -> Result<u64, Error> {
+        self.check_version_conflicts()?;
+
+        // Allocate the commit timestamp and hold the lock across the commit so
+        // timestamps are monotonic and the watermark advances only when visible.
+        let mut clock = self.engine.lock_commit_clock();
+        let ts = std::cmp::max(crate::storage::key::current_timestamp(), *clock + 1);
+
+        if self.ops.is_empty() {
+            *clock = ts;
+            self.engine.publish_watermark(ts);
+            return Ok(ts);
+        }
+
+        let index_work = self.collect_index_work()?;
+
+        let data_tree = self.engine.data_tree();
+        let meta_tree = self.engine.meta_tree();
+        let type_index_tree = self.engine.type_index_tree();
+
+        let result: Result<(), sled::transaction::TransactionError<Error>> =
+            (data_tree, meta_tree, type_index_tree).transaction(|(data_tx, meta_tx, type_tx)| {
+                for op in &self.ops {
+                    match op {
+                        TransactionOp::Put { entity_type, key, record } => {
+                            let stamped = VersionedKey::new(key.entity_id, ts);
+                            Self::execute_put(data_tx, meta_tx, &stamped, record)?;
+                            if !entity_type.is_empty() {
+                                Self::execute_type_index(type_tx, entity_type, &key.entity_id)?;
+                            }
+                        }
+                        TransactionOp::Update { entity_type, entity_id, record } => {
+                            let stamped = VersionedKey::new(*entity_id, ts);
+                            Self::execute_put(data_tx, meta_tx, &stamped, record)?;
+                            if !entity_type.is_empty() {
+                                Self::execute_type_index(type_tx, entity_type, entity_id)?;
+                            }
+                        }
+                        TransactionOp::Delete { entity_type: _, entity_id } => {
+                            let stamped = VersionedKey::new(*entity_id, ts);
+                            Self::execute_put(data_tx, meta_tx, &stamped, &Record::tombstone())?;
+                        }
+                    }
+                }
+                Ok(())
+            });
+
+        match result {
+            Ok(()) => {
+                self.apply_index_updates(index_work)?;
+                // Publish the watermark only after the data is durably visible.
+                *clock = ts;
+                self.engine.publish_watermark(ts);
+                Ok(ts)
+            }
+            Err(sled::transaction::TransactionError::Abort(e)) => Err(e),
+            Err(sled::transaction::TransactionError::Storage(e)) => Err(Error::Storage(e)),
+        }
+    }
+
     /// Check for version conflicts on expected versions.
     fn check_version_conflicts(&self) -> Result<(), Error> {
         for (entity_id, expected_version) in &self.expected_versions {

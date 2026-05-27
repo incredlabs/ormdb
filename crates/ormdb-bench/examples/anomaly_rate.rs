@@ -59,7 +59,10 @@ fn write_generation(storage: &StorageEngine, pairs: &[([u8; 16], [u8; 16])], gen
         txn.put_typed("User", VersionedKey::new(*user, ts), record(user_fields(*user, generation)));
         txn.put_typed("Post", VersionedKey::new(*post, ts), record(post_fields(*post, *user, generation)));
     }
-    txn.commit().unwrap();
+    // commit_versioned re-stamps every write with one monotonic commit timestamp
+    // and advances the read watermark only once the data is visible — so a reader
+    // that captures the watermark sees a single consistent generation.
+    txn.commit_versioned().unwrap();
 }
 
 /// Collect the distinct generation tags present across all `User.name` and

@@ -32,6 +32,10 @@ fn post_fields(id: [u8; 16], author_id: [u8; 16], generation: i64) -> Vec<(Strin
     ]
 }
 
+fn rec(fields: Vec<(String, Value)>) -> Record {
+    Record::new(encode_entity(&fields).unwrap())
+}
+
 fn put(storage: &StorageEngine, entity_type: &str, id: [u8; 16], version_ts: u64, fields: Vec<(String, Value)>) {
     let data = encode_entity(&fields).unwrap();
     storage
@@ -128,6 +132,38 @@ fn snapshot_excludes_writes_after_read_ts() {
     let r2 = ctx.executor().execute_as_of(&query, 2_500).unwrap();
     let post_block2 = r2.entities.iter().find(|b| b.entity == "Post").unwrap();
     assert_eq!(post_block2.len(), 2);
+}
+
+/// With `commit_versioned`, the read watermark anchors a sound snapshot: a fetch
+/// as-of the old watermark sees one consistent generation for root AND include,
+/// even though a newer generation has since committed.
+#[test]
+fn watermark_snapshot_is_consistent_under_versioned_commits() {
+    let ctx = TestContext::with_schema();
+    let storage = &ctx.storage;
+    let user = StorageEngine::generate_id();
+    let post = StorageEngine::generate_id();
+
+    // gen0 via commit_versioned advances the watermark.
+    let mut t0 = storage.transaction();
+    t0.put_typed("User", VersionedKey::now(user), rec(user_fields(user, 0)));
+    t0.put_typed("Post", VersionedKey::now(post), rec(post_fields(post, user, 0)));
+    t0.commit_versioned().unwrap();
+    let w0 = storage.read_watermark();
+
+    // gen1 via commit_versioned gets a strictly greater timestamp.
+    let mut t1 = storage.transaction();
+    t1.put_typed("User", VersionedKey::now(user), rec(user_fields(user, 1)));
+    t1.put_typed("Post", VersionedKey::now(post), rec(post_fields(post, user, 1)));
+    let ts1 = t1.commit_versioned().unwrap();
+    assert!(ts1 > w0, "commit timestamps must be monotonic");
+    assert!(storage.read_watermark() > w0);
+
+    // A fetch as-of the old watermark sees gen0 for both root and include.
+    let query = GraphQuery::new("User").include(RelationInclude::new("posts"));
+    let r = ctx.executor().execute_as_of(&query, w0).unwrap();
+    assert_eq!(block_str(&r, "User", "name"), "gen0");
+    assert_eq!(block_str(&r, "Post", "title"), "gen0");
 }
 
 /// `get_as_of` respects tombstones: a deletion at-or-before the read point hides

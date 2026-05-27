@@ -8,7 +8,8 @@ use crate::error::Error;
 use crate::query::decode_entity;
 use sled::{Db, Tree};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use ormdb_proto::Value;
 
 /// Tree name for entity data.
@@ -57,6 +58,18 @@ pub struct StorageEngine {
 
     /// Full-text index for text search (inverted index with BM25).
     fulltext_index: Option<FullTextIndex>,
+
+    /// Commit-timestamp oracle: last allocated commit timestamp.
+    ///
+    /// Held across the commit critical section so commit timestamps are
+    /// allocated monotonically and the read watermark is only advanced once a
+    /// transaction's data is visible. See [`super::Transaction::commit_versioned`].
+    commit_clock: Mutex<u64>,
+
+    /// Read watermark: the highest commit timestamp whose transaction is fully
+    /// committed and safe to read at. A snapshot taken at this value sees a
+    /// consistent prefix; any later commit gets a strictly greater timestamp.
+    watermark: AtomicU64,
 }
 
 impl StorageEngine {
@@ -124,7 +137,27 @@ impl StorageEngine {
             vector_index,
             geo_index,
             fulltext_index,
+            commit_clock: Mutex::new(0),
+            watermark: AtomicU64::new(0),
         })
+    }
+
+    /// Read the current commit watermark — the highest commit timestamp safe to
+    /// snapshot at. Use as `read_ts` for a snapshot-consistent graph fetch.
+    pub fn read_watermark(&self) -> u64 {
+        self.watermark.load(Ordering::Acquire)
+    }
+
+    /// Lock the commit-timestamp oracle for the duration of a commit. The guard
+    /// holds the last allocated commit timestamp.
+    pub(crate) fn lock_commit_clock(&self) -> MutexGuard<'_, u64> {
+        self.commit_clock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Publish a new read watermark after a commit's data is durably visible.
+    /// Must be called while holding the commit-clock lock.
+    pub(crate) fn publish_watermark(&self, ts: u64) {
+        self.watermark.store(ts, Ordering::Release);
     }
 
     /// Check if the database was recovered from a previous crash.

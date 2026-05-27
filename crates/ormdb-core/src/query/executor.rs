@@ -119,12 +119,18 @@ impl<'a> QueryExecutor<'a> {
         result
     }
 
-    /// Execute a graph fetch under a snapshot taken at call time.
+    /// Execute a graph fetch under a snapshot taken at the current commit
+    /// watermark.
     ///
-    /// Equivalent to [`Self::execute_as_of`] with `read_ts = now`. Writes that
-    /// commit after this point are excluded from the result.
+    /// Captures [`StorageEngine::read_watermark`] — the highest commit timestamp
+    /// whose transaction is fully visible — and reads everything as-of it. Because
+    /// commits assign strictly increasing timestamps and publish the watermark only
+    /// after their data is visible (see [`crate::storage::Transaction::commit_versioned`]),
+    /// any write committing after this call lands at a greater timestamp and is
+    /// excluded from every sub-read. Sound under concurrency, provided writers use
+    /// `commit_versioned`.
     pub fn execute_snapshot(&self, query: &GraphQuery) -> Result<QueryResult, Error> {
-        self.execute_as_of(query, crate::storage::key::current_timestamp())
+        self.execute_as_of(query, self.storage.read_watermark())
     }
 
     /// Execute a query with a custom fanout budget.
