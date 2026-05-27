@@ -12,6 +12,8 @@ pub mod error;
 pub mod handler;
 pub mod mutation;
 pub mod pubsub;
+#[cfg(feature = "raft")]
+pub mod raft_apply;
 pub mod replication;
 pub mod transport;
 
@@ -26,5 +28,7 @@ pub use error::Error;
 pub use handler::RequestHandler;
 pub use mutation::MutationExecutor;
 pub use pubsub::{PubSubManager, SubscriptionEntry, SubscriptionFilter};
+#[cfg(feature = "raft")]
+pub use raft_apply::make_apply_fn;
 pub use replication::{ReplicationManager, SharedReplicationManager};
 pub use transport::{create_transport, Transport, TransportMetrics};

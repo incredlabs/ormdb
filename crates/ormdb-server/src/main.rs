@@ -59,11 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let db = Arc::new(database.storage().db().clone());
+        // Apply committed Raft entries to this node's local storage.
+        let apply_fn = ormdb_server::make_apply_fn(database.clone());
         let manager = RaftClusterManager::new(
             raft_config.clone(),
             database.storage_arc(),
             db,
-            None, // apply_fn will be set later when we integrate mutations
+            Some(apply_fn),
         )
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
