@@ -665,6 +665,11 @@ impl TransportWorker {
                 (response, is_ok)
             }
             Err(e) => {
+                // A connection's first message is a Handshake, not a Request, so it
+                // won't deserialize as one. Try handshake handling before erroring.
+                if let Some(bytes) = self.try_handshake(data) {
+                    return (bytes, true);
+                }
                 tracing::error!(error = %e, "request processing error");
                 // Return error response with request ID 0 (unknown)
                 let response = Response::error(0, error_codes::INTERNAL, e.to_string());
@@ -683,6 +688,41 @@ impl TransportWorker {
         };
 
         (bytes, is_success)
+    }
+
+    /// Try to handle the message as a connection handshake.
+    ///
+    /// The client sends a `Handshake` as the first message on a connection; the
+    /// server has no separate handshake step, so we detect it here (only after a
+    /// `Request` deserialize has failed, which keeps false positives away from
+    /// real requests) and reply with a framed `HandshakeResponse`.
+    fn try_handshake(&self, data: &[u8]) -> Option<Vec<u8>> {
+        let payload = ormdb_proto::framing::extract_payload(data).ok()?;
+        let mut aligned: rkyv::util::AlignedVec<16> = rkyv::util::AlignedVec::new();
+        aligned.extend_from_slice(payload);
+        let handshake =
+            rkyv::from_bytes::<ormdb_proto::handshake::Handshake, rkyv::rancor::Error>(&aligned)
+                .ok()?;
+
+        let response = if ormdb_proto::handshake::is_version_compatible(
+            handshake.protocol_version,
+            ormdb_proto::PROTOCOL_VERSION,
+        ) {
+            ormdb_proto::handshake::HandshakeResponse::accept(
+                ormdb_proto::PROTOCOL_VERSION,
+                self.handler.schema_version(),
+                "ormdb-server",
+            )
+        } else {
+            ormdb_proto::handshake::HandshakeResponse::reject(format!(
+                "incompatible protocol version: client={} server={}",
+                handshake.protocol_version,
+                ormdb_proto::PROTOCOL_VERSION
+            ))
+        };
+
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&response).ok()?;
+        encode_frame(&payload).ok()
     }
 
     /// Decode a request and dispatch to handler.

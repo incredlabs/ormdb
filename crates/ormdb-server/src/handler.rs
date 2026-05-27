@@ -146,6 +146,11 @@ impl RequestHandler {
         self
     }
 
+    /// Current schema version (used in the connection handshake response).
+    pub fn schema_version(&self) -> u64 {
+        self.database.schema_version()
+    }
+
     /// Create a new request handler with metrics and Raft support.
     #[cfg(feature = "raft")]
     pub fn with_metrics_and_raft(
