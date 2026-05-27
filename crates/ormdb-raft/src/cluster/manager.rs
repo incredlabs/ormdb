@@ -19,6 +19,17 @@ use crate::types::{ClientRequest, ClientResponse, NodeId, OrmdbRaft, TypeConfig}
 /// Type alias for shared cluster manager.
 pub type SharedRaftClusterManager = Arc<RaftClusterManager>;
 
+/// A write submitted to the async writer task, carrying a synchronous reply channel.
+///
+/// This lets a synchronous caller (e.g. the request handler, which runs on a
+/// blocking thread) submit a write to async Raft without itself touching the
+/// async runtime: it hands the request to the writer task and blocks on a std
+/// channel for the committed result.
+struct WriteJob {
+    request: ClientRequest,
+    reply: std::sync::mpsc::Sender<Result<ClientResponse, RaftError>>,
+}
+
 /// Manages the Raft cluster for ORMDB.
 ///
 /// This is the main entry point for interacting with the Raft subsystem.
@@ -36,6 +47,8 @@ pub struct RaftClusterManager {
     config: RaftConfig,
     /// Cached leader information.
     cached_leader: RwLock<Option<(NodeId, String)>>,
+    /// Sender to the async writer task (for synchronous callers).
+    write_tx: tokio::sync::mpsc::UnboundedSender<WriteJob>,
     /// Transport shutdown handle.
     _transport_shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -103,6 +116,23 @@ impl RaftClusterManager {
 
         let raft = Arc::new(raft);
 
+        // Spawn an async writer task. Synchronous callers submit writes via
+        // `write_blocking`, which forwards them here and blocks on a std channel.
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<WriteJob>();
+        {
+            let raft = raft.clone();
+            tokio::spawn(async move {
+                while let Some(job) = write_rx.recv().await {
+                    let result = raft
+                        .client_write(job.request)
+                        .await
+                        .map(|r| r.data)
+                        .map_err(|e| RaftError::Write(e.to_string()));
+                    let _ = job.reply.send(result);
+                }
+            });
+        }
+
         // Start transport server (with TLS if configured)
         let (_, shutdown_tx) = if config.tls.enabled {
             spawn_transport_with_tls(
@@ -120,6 +150,7 @@ impl RaftClusterManager {
             raft,
             config,
             cached_leader: RwLock::new(None),
+            write_tx,
             _transport_shutdown: shutdown_tx,
         })
     }
@@ -159,6 +190,25 @@ impl RaftClusterManager {
             .map_err(|e| RaftError::Write(e.to_string()))?;
 
         Ok(result.data)
+    }
+
+    /// Submit a client request and block until it is committed and applied.
+    ///
+    /// Safe to call from a synchronous context (the request handler runs on a
+    /// blocking thread): the request is forwarded to the async writer task and the
+    /// caller blocks on a std channel for the reply, so this never touches the
+    /// async runtime from the calling thread. Only succeeds on the leader.
+    pub fn write_blocking(&self, request: ClientRequest) -> Result<ClientResponse, RaftError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.write_tx
+            .send(WriteJob {
+                request,
+                reply: reply_tx,
+            })
+            .map_err(|_| RaftError::Internal("raft writer task is not running".to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| RaftError::Internal("raft writer task dropped the reply".to_string()))?
     }
 
     /// Check if this node is the leader.

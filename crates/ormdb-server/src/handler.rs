@@ -13,13 +13,16 @@ use ormdb_core::security::{
 };
 use ormdb_proto::{
     error_codes, AggregateQuery, CacheMetrics, EntityCount, EntityQueryCount, MetricsResult,
-    Mutation, MutationMetrics, Operation, QueryMetrics, ReplicationRole, ReplicationStatus,
+    Mutation, MutationMetrics, MutationResult, Operation, QueryMetrics, ReplicationRole, ReplicationStatus,
     Request, Response, StorageMetrics, StreamChangesRequest, StreamChangesResponse,
     TransportMetrics,
 };
 
 #[cfg(feature = "raft")]
-use ormdb_raft::RaftClusterManager;
+use ormdb_raft::{
+    types::{ClientRequest, ClientResponse},
+    RaftClusterManager,
+};
 
 use crate::database::Database;
 use crate::error::Error;
@@ -465,6 +468,35 @@ impl RequestHandler {
         Ok(Response::aggregate_ok(request_id, result))
     }
 
+    /// Replicate a write through Raft and return the applied result.
+    ///
+    /// Only the leader accepts writes; followers reject with a hint to retry on
+    /// the leader. The mutation is applied on every node via the state machine's
+    /// apply callback (see `raft_apply::make_apply_fn`), so we do not also execute
+    /// it locally here.
+    #[cfg(feature = "raft")]
+    fn raft_write(
+        &self,
+        raft: &RaftClusterManager,
+        request: ClientRequest,
+    ) -> Result<MutationResult, Error> {
+        if !raft.is_leader() {
+            return Err(Error::Database(
+                "not the leader; writes must be sent to the current cluster leader".to_string(),
+            ));
+        }
+        match raft
+            .write_blocking(request)
+            .map_err(|e| Error::Database(format!("raft write failed: {}", e)))?
+        {
+            ClientResponse::MutationResult(result) => Ok(result),
+            ClientResponse::Error(msg) => Err(Error::Database(msg)),
+            ClientResponse::NoopResult => {
+                Err(Error::Database("unexpected noop response from raft".to_string()))
+            }
+        }
+    }
+
     /// Handle a single mutation operation.
     #[instrument(skip(self, mutation, context), fields(entity = %mutation.entity(), mutation_type = ?std::mem::discriminant(mutation)))]
     fn handle_mutate(
@@ -473,8 +505,16 @@ impl RequestHandler {
         mutation: &ormdb_proto::Mutation,
         context: &SecurityContext,
     ) -> Result<Response, Error> {
-        let executor = MutationExecutor::new(&self.database);
-        let result = executor.execute(mutation)?;
+        // In cluster mode, route the write through Raft consensus; the leader
+        // applies it (and replicates to followers) via the apply callback.
+        #[cfg(feature = "raft")]
+        let result = if let Some(raft) = &self.raft_manager {
+            self.raft_write(raft, ClientRequest::Mutate(mutation.clone()))?
+        } else {
+            MutationExecutor::new(&self.database).execute(mutation)?
+        };
+        #[cfg(not(feature = "raft"))]
+        let result = MutationExecutor::new(&self.database).execute(mutation)?;
 
         // Determine mutation operation type
         let op = match mutation {
@@ -503,8 +543,14 @@ impl RequestHandler {
         batch: &ormdb_proto::MutationBatch,
         context: &SecurityContext,
     ) -> Result<Response, Error> {
-        let executor = MutationExecutor::new(&self.database);
-        let result = executor.execute_batch(batch)?;
+        #[cfg(feature = "raft")]
+        let result = if let Some(raft) = &self.raft_manager {
+            self.raft_write(raft, ClientRequest::MutateBatch(batch.clone()))?
+        } else {
+            MutationExecutor::new(&self.database).execute_batch(batch)?
+        };
+        #[cfg(not(feature = "raft"))]
+        let result = MutationExecutor::new(&self.database).execute_batch(batch)?;
 
         // Log audit events for each mutation in the batch
         for mutation in &batch.mutations {
