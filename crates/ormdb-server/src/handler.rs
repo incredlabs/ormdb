@@ -30,12 +30,42 @@ use crate::mutation::MutationExecutor;
 
 const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Read consistency level applied to graph-fetch queries.
+///
+/// Lets a deployment select how reads observe concurrent writes — the axis the
+/// object-graph isolation study compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadConsistency {
+    /// Each sub-read sees the latest committed version independently (permits
+    /// fractured graph reads). The historical default and fastest path.
+    #[default]
+    ReadCommitted,
+    /// Root and all includes read as-of one commit watermark (graph-atomic).
+    Snapshot,
+    /// Snapshot read ordered with respect to the Raft log via ReadIndex
+    /// (leader only). Falls back to `Snapshot` if Raft is not configured.
+    Linearizable,
+}
+
+impl ReadConsistency {
+    /// Parse from a string (e.g. an env var or CLI flag). Unknown values map to
+    /// the default (read-committed).
+    pub fn from_str_or_default(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "snapshot" => ReadConsistency::Snapshot,
+            "linearizable" | "linear" => ReadConsistency::Linearizable,
+            _ => ReadConsistency::ReadCommitted,
+        }
+    }
+}
+
 /// Handles incoming requests and dispatches to appropriate handlers.
 pub struct RequestHandler {
     database: Arc<Database>,
     metrics: Option<SharedMetricsRegistry>,
     authenticator: Arc<dyn CapabilityAuthenticator + Send + Sync>,
     audit_logger: Arc<dyn AuditLogger>,
+    read_consistency: ReadConsistency,
     #[cfg(feature = "raft")]
     raft_manager: Option<Arc<RaftClusterManager>>,
 }
@@ -49,6 +79,7 @@ impl RequestHandler {
             metrics: None,
             authenticator: Arc::new(DevAuthenticator),
             audit_logger: Arc::new(NullAuditLogger),
+            read_consistency: ReadConsistency::default(),
             #[cfg(feature = "raft")]
             raft_manager: None,
         }
@@ -64,6 +95,7 @@ impl RequestHandler {
             metrics: None,
             authenticator,
             audit_logger: Arc::new(NullAuditLogger),
+            read_consistency: ReadConsistency::default(),
             #[cfg(feature = "raft")]
             raft_manager: None,
         }
@@ -77,6 +109,7 @@ impl RequestHandler {
             metrics: Some(metrics),
             authenticator: Arc::new(DevAuthenticator),
             audit_logger: Arc::new(NullAuditLogger),
+            read_consistency: ReadConsistency::default(),
             #[cfg(feature = "raft")]
             raft_manager: None,
         }
@@ -93,6 +126,7 @@ impl RequestHandler {
             metrics: Some(metrics),
             authenticator,
             audit_logger: Arc::new(NullAuditLogger),
+            read_consistency: ReadConsistency::default(),
             #[cfg(feature = "raft")]
             raft_manager: None,
         }
@@ -101,6 +135,12 @@ impl RequestHandler {
     /// Set the audit logger.
     pub fn with_audit_logger(mut self, logger: Arc<dyn AuditLogger>) -> Self {
         self.audit_logger = logger;
+        self
+    }
+
+    /// Set the read consistency level applied to graph-fetch queries.
+    pub fn with_read_consistency(mut self, mode: ReadConsistency) -> Self {
+        self.read_consistency = mode;
         self
     }
 
@@ -116,6 +156,7 @@ impl RequestHandler {
             metrics: Some(metrics),
             authenticator: Arc::new(DevAuthenticator),
             audit_logger: Arc::new(NullAuditLogger),
+            read_consistency: ReadConsistency::default(),
             raft_manager,
         }
     }
@@ -133,6 +174,7 @@ impl RequestHandler {
             metrics: Some(metrics),
             authenticator,
             audit_logger: Arc::new(NullAuditLogger),
+            read_consistency: ReadConsistency::default(),
             raft_manager,
         }
     }
@@ -427,11 +469,29 @@ impl RequestHandler {
         } else {
             self.database.executor_with_security(context)
         };
-        let statistics = self.database.statistics();
-        let cache = self.database.plan_cache();
-        let result = executor
-            .execute_with_cache(query, cache, Some(statistics))
-            .map_err(|e| Error::Database(format!("query execution failed: {}", e)))?;
+        let result = match self.read_consistency {
+            ReadConsistency::ReadCommitted => {
+                let statistics = self.database.statistics();
+                let cache = self.database.plan_cache();
+                executor
+                    .execute_with_cache(query, cache, Some(statistics))
+                    .map_err(|e| Error::Database(format!("query execution failed: {}", e)))?
+            }
+            ReadConsistency::Snapshot => executor
+                .execute_snapshot(query)
+                .map_err(|e| Error::Database(format!("snapshot query failed: {}", e)))?,
+            ReadConsistency::Linearizable => {
+                // ReadIndex first (leader only); then a snapshot-consistent fetch.
+                #[cfg(feature = "raft")]
+                if let Some(raft) = &self.raft_manager {
+                    raft.ensure_linearizable_blocking()
+                        .map_err(|e| Error::Database(format!("linearizable read failed: {}", e)))?;
+                }
+                executor
+                    .execute_snapshot(query)
+                    .map_err(|e| Error::Database(format!("linearizable query failed: {}", e)))?
+            }
+        };
 
         let result_count = result.entities.first().map(|e| e.len()).unwrap_or(0);
         let duration_ms = start.elapsed().as_millis() as u64;

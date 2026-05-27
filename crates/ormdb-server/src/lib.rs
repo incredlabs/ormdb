@@ -25,7 +25,7 @@ pub use config::{
 };
 pub use database::{CompactionTask, Database, SharedDatabase};
 pub use error::Error;
-pub use handler::RequestHandler;
+pub use handler::{ReadConsistency, RequestHandler};
 pub use mutation::MutationExecutor;
 pub use pubsub::{PubSubManager, SubscriptionEntry, SubscriptionFilter};
 #[cfg(feature = "raft")]

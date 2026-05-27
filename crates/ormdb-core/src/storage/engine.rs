@@ -160,6 +160,22 @@ impl StorageEngine {
         self.watermark.store(ts, Ordering::Release);
     }
 
+    /// Advance the read watermark to at least the current time, returning the new
+    /// value. Call this after applying committed writes that were stamped with
+    /// wall-clock version timestamps (e.g. the `MutationExecutor` direct-write
+    /// path), so a subsequent snapshot read (`execute_snapshot`) observes them.
+    ///
+    /// Monotonic: the watermark never goes backwards. Because the just-written
+    /// records carry `version_ts <= now`, reading as-of the returned watermark
+    /// includes them.
+    pub fn tick_watermark(&self) -> u64 {
+        let mut clock = self.commit_clock.lock().unwrap_or_else(|e| e.into_inner());
+        let ts = std::cmp::max(*clock + 1, super::key::current_timestamp());
+        *clock = ts;
+        self.watermark.store(ts, Ordering::Release);
+        ts
+    }
+
     /// Check if the database was recovered from a previous crash.
     pub fn was_recovered(&self) -> bool {
         self.db.was_recovered()

@@ -22,12 +22,15 @@ impl<'a> MutationExecutor<'a> {
 
     /// Execute a single mutation (without CDC logging).
     pub fn execute(&self, mutation: &Mutation) -> Result<MutationResult, Error> {
-        match mutation {
+        let result = match mutation {
             Mutation::Insert { entity, data } => self.execute_insert(entity, data),
             Mutation::Update { entity, id, data } => self.execute_update(entity, id, data),
             Mutation::Delete { entity, id } => self.execute_delete(entity, id),
             Mutation::Upsert { entity, id, data } => self.execute_upsert(entity, id.as_ref(), data),
-        }
+        }?;
+        // Advance the read watermark so snapshot reads observe this write.
+        self.database.storage().tick_watermark();
+        Ok(result)
     }
 
     /// Execute a single mutation with CDC logging.
@@ -37,7 +40,7 @@ impl<'a> MutationExecutor<'a> {
         let changelog = self.database.changelog();
         let schema_version = self.database.schema_version();
 
-        match mutation {
+        let result = match mutation {
             Mutation::Insert { entity, data } => {
                 self.execute_insert_with_cdc(entity, data, changelog, schema_version)
             }
@@ -50,7 +53,10 @@ impl<'a> MutationExecutor<'a> {
             Mutation::Upsert { entity, id, data } => {
                 self.execute_upsert_with_cdc(entity, id.as_ref(), data, changelog, schema_version)
             }
-        }
+        }?;
+        // Advance the read watermark so snapshot reads observe this write.
+        self.database.storage().tick_watermark();
+        Ok(result)
     }
 
     /// Execute a batch of mutations atomically (without CDC logging).
@@ -652,6 +658,27 @@ mod tests {
         db.catalog().apply_schema(schema).unwrap();
 
         (dir, db)
+    }
+
+    #[test]
+    fn snapshot_read_sees_committed_mutation_via_watermark() {
+        use ormdb_core::query::QueryExecutor;
+        use ormdb_proto::GraphQuery;
+
+        let (_dir, db) = setup_test_db();
+        MutationExecutor::new(&db)
+            .execute(&Mutation::insert("User", vec![FieldValue::new("name", "Zoe")]))
+            .unwrap();
+
+        // execute_snapshot reads as-of the watermark; if execute() did not advance
+        // the watermark, this would read as-of 0 and see nothing.
+        let qexec = QueryExecutor::new(db.storage(), db.catalog());
+        let result = qexec.execute_snapshot(&GraphQuery::new("User")).unwrap();
+        assert_eq!(
+            result.entities[0].len(),
+            1,
+            "snapshot read must observe the committed insert (watermark advanced)"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use ormdb_core::metrics::new_shared_registry;
 use ormdb_core::security::{CapabilityAuthenticator, DevAuthenticator};
 use ormdb_server::{
     create_transport, ApiKeyAuthenticator, Args, AuthMethod, CompactionTask, Database,
-    JwtAuthenticator, RequestHandler, TokenAuthenticator,
+    JwtAuthenticator, ReadConsistency, RequestHandler, TokenAuthenticator,
 };
 
 #[cfg(feature = "raft")]
@@ -131,27 +131,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create request handler
     let metrics = new_shared_registry();
+    // Read consistency for graph fetches (rc | snapshot | linearizable).
+    let read_consistency = std::env::var("ORMDB_READ_CONSISTENCY")
+        .map(|s| ReadConsistency::from_str_or_default(&s))
+        .unwrap_or_default();
+    tracing::info!(?read_consistency, "read consistency configured");
+
     #[cfg(feature = "raft")]
-    let handler = if raft_manager.is_some() {
-        Arc::new(RequestHandler::with_full_config(
-            database.clone(),
-            metrics,
-            authenticator,
-            raft_manager.clone(),
-        ))
-    } else {
-        Arc::new(RequestHandler::with_metrics_and_authenticator(
-            database.clone(),
-            metrics,
-            authenticator,
-        ))
+    let handler = {
+        let h = if raft_manager.is_some() {
+            RequestHandler::with_full_config(
+                database.clone(),
+                metrics,
+                authenticator,
+                raft_manager.clone(),
+            )
+        } else {
+            RequestHandler::with_metrics_and_authenticator(database.clone(), metrics, authenticator)
+        };
+        Arc::new(h.with_read_consistency(read_consistency))
     };
     #[cfg(not(feature = "raft"))]
-    let handler = Arc::new(RequestHandler::with_metrics_and_authenticator(
-        database.clone(),
-        metrics,
-        authenticator,
-    ));
+    let handler = Arc::new(
+        RequestHandler::with_metrics_and_authenticator(database.clone(), metrics, authenticator)
+            .with_read_consistency(read_consistency),
+    );
 
     // Start background compaction if enabled
     let compaction_task = config
