@@ -79,25 +79,42 @@ impl<'a> MutationExecutor<'a> {
 
     /// Execute a single mutation (without CDC logging).
     pub fn execute(&self, mutation: &Mutation) -> Result<MutationResult, Error> {
-        let result = match mutation {
+        let result = self.execute_no_advance(mutation)?;
+        // Advance the read watermark so snapshot reads observe this write.
+        self.advance_watermark();
+        Ok(result)
+    }
+
+    /// Execute a mutation WITHOUT advancing the read watermark.
+    ///
+    /// Used internally by `execute_batch` so the watermark advances **once**
+    /// after the whole batch — critical when a MutateBatch is applied as one
+    /// Raft log entry: per-op advance would publish a new watermark mid-batch
+    /// and let a concurrent snapshot reader observe a partial batch (fracture).
+    fn execute_no_advance(&self, mutation: &Mutation) -> Result<MutationResult, Error> {
+        match mutation {
             Mutation::Insert { entity, data } => self.execute_insert(entity, data),
             Mutation::Update { entity, id, data } => self.execute_update(entity, id, data),
             Mutation::Delete { entity, id } => self.execute_delete(entity, id),
             Mutation::Upsert { entity, id, data } => self.execute_upsert(entity, id.as_ref(), data),
-        }?;
-        // Advance the read watermark so snapshot reads observe this write.
-        self.advance_watermark();
-        Ok(result)
+        }
     }
 
     /// Execute a single mutation with CDC logging.
     ///
     /// This logs the mutation to the changelog after successful execution.
     pub fn execute_with_cdc(&self, mutation: &Mutation) -> Result<MutationResult, Error> {
+        let result = self.execute_with_cdc_no_advance(mutation)?;
+        self.advance_watermark();
+        Ok(result)
+    }
+
+    /// CDC variant of [`Self::execute_no_advance`] (see its docs for why).
+    fn execute_with_cdc_no_advance(&self, mutation: &Mutation) -> Result<MutationResult, Error> {
         let changelog = self.database.changelog();
         let schema_version = self.database.schema_version();
 
-        let result = match mutation {
+        match mutation {
             Mutation::Insert { entity, data } => {
                 self.execute_insert_with_cdc(entity, data, changelog, schema_version)
             }
@@ -110,10 +127,7 @@ impl<'a> MutationExecutor<'a> {
             Mutation::Upsert { entity, id, data } => {
                 self.execute_upsert_with_cdc(entity, id.as_ref(), data, changelog, schema_version)
             }
-        }?;
-        // Advance the read watermark so snapshot reads observe this write.
-        self.advance_watermark();
-        Ok(result)
+        }
     }
 
     /// Execute a batch of mutations atomically (without CDC logging).
@@ -125,14 +139,16 @@ impl<'a> MutationExecutor<'a> {
         let mut inserted_ids = Vec::new();
         let mut affected = 0u64;
 
-        // Execute each mutation in order
-        // Note: For true atomicity, we'd use sled transactions here.
-        // For now, we execute sequentially which is sufficient for most use cases.
+        // Execute each mutation WITHOUT advancing the watermark per op — a Raft
+        // MutateBatch is one log entry, atomic, and per-op watermark advance
+        // would publish a new snapshot mid-batch (fractured snapshot reads).
         for mutation in &batch.mutations {
-            let result = self.execute(mutation)?;
+            let result = self.execute_no_advance(mutation)?;
             affected += result.affected;
             inserted_ids.extend(result.inserted_ids);
         }
+        // Publish the new watermark once, after the whole batch is applied.
+        self.advance_watermark();
 
         if inserted_ids.is_empty() {
             Ok(MutationResult::affected(affected))
@@ -151,10 +167,11 @@ impl<'a> MutationExecutor<'a> {
         let mut affected = 0u64;
 
         for mutation in &batch.mutations {
-            let result = self.execute_with_cdc(mutation)?;
+            let result = self.execute_with_cdc_no_advance(mutation)?;
             affected += result.affected;
             inserted_ids.extend(result.inserted_ids);
         }
+        self.advance_watermark();
 
         if inserted_ids.is_empty() {
             Ok(MutationResult::affected(affected))
