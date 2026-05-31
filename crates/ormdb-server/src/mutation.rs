@@ -400,10 +400,15 @@ impl<'a> MutationExecutor<'a> {
         let (_version, record) = existing.unwrap();
         let before_data = record.data.clone();
 
-        // Soft delete (creates tombstone)
+        // Soft delete (creates tombstone). Use self.version_key so the tombstone
+        // is stamped with the commit timestamp on the Raft apply path — otherwise
+        // the engine's default VersionedKey::now() would write the tombstone at a
+        // wall-clock time far above the snapshot watermark, and as-of reads at
+        // the watermark would still see the deleted entity's pre-tombstone value.
+        let key = self.version_key(*id);
         self.database
             .storage()
-            .delete_typed(entity, id)
+            .put_typed(entity, key, Record::tombstone())
             .map_err(|e| Error::Storage(e))?;
         self.database.statistics().decrement(entity);
         self.update_secondary_indexes(entity, *id, Some(&before_data), None)?;
